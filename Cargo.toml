@@ -1,0 +1,22 @@
+[package]
+name = "leadline"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Scripted mock database for testing SeaORM"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/apognu/leadline"
+documentation = "https://docs.rs/leadline"
+keywords = ["sea-orm", "mock", "testing", "database", "orm"]
+categories = ["development-tools::testing", "database"]
+
+[dependencies]
+async-trait = "0.1"
+regex = "1"
+sea-orm = { version = "2.0", default-features = false, features = ["proxy", "mock"] }
+sqlparser = { version = "0.63", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+sea-orm = { version = "2.0", default-features = false, features = ["macros", "with-json", "with-uuid"] }
+tokio = { version = "1", features = ["macros", "rt"] }
