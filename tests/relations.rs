@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::schema::*;
+use common::{problems, schema::*};
 use leadline::MockDb;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DbBackend, EntityTrait, JoinType, LoaderTrait, ModelTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait};
 
@@ -227,7 +227,6 @@ async fn insert_into_junction_with_composite_key_on_mysql() {
 }
 
 #[tokio::test]
-#[should_panic(expected = r#"it targets "bakery", not "cake""#)]
 async fn typed_expectations_check_the_main_table() {
   let mock = MockDb::new(DbBackend::Postgres);
 
@@ -235,5 +234,10 @@ async fn typed_expectations_check_the_main_table() {
   mock.expect_select::<cake::Entity>().returning::<cake::Model>([]);
 
   let db = mock.connection().await;
-  let _ = bakery::Entity::find().inner_join(cake::Entity).filter(cake::Column::Name.eq("Chocolate")).all(&db).await;
+  let problems = problems(&mock, async move {
+    let _ = bakery::Entity::find().inner_join(cake::Entity).filter(cake::Column::Name.eq("Chocolate")).all(&db).await;
+  })
+  .await;
+
+  assert!(problems[0].contains("it targets `bakery`, not `cake`"), "{problems:?}");
 }

@@ -1,11 +1,12 @@
-use std::{fmt, sync::Arc};
+use std::{fmt, panic::Location, sync::Arc};
 
 use sea_orm::{DbBackend, DbErr, IntoMockRow, ProxyExecResult, ProxyRow, Statement};
 
 use crate::{
   classify::StmtKind,
-  matcher::{Arg, SqlMatcher, StatementExt, args_match, normalize},
+  matcher::{Arg, SqlMatcher, StatementExt, normalize, wrong_args},
   parse::Parsed,
+  problem::{Declared, Mismatch, Rejection},
 };
 
 pub(crate) type RowsFn = Arc<dyn Fn(&Statement) -> Result<Vec<ProxyRow>, DbErr> + Send + Sync>;
@@ -28,6 +29,7 @@ pub(crate) enum Exec {
 /// What it matches (`spec`) and what it answers (`response`) are behind `Arc`s,
 /// so that they can be copied out of the mock's state, and user closures called
 /// without holding its lock.
+#[derive(Clone)]
 pub(crate) struct Expectation {
   pub spec: Arc<Spec>,
   pub response: Arc<Response>,
@@ -36,6 +38,9 @@ pub(crate) struct Expectation {
   /// Calls after which the expectation stops matching.
   pub max: usize,
   pub calls: usize,
+  /// Where the test declared the expectation: the line of its
+  /// `mock.expect_*()` call, which failure messages point at.
+  pub location: &'static Location<'static>,
 }
 
 /// Which statements an expectation accepts.
@@ -66,8 +71,9 @@ pub(crate) struct Response {
 }
 
 impl Expectation {
-  /// An expectation for statements of `kind`, or of any kind for `None`.
-  pub fn new(kind: Option<StmtKind>) -> Self {
+  /// Create an expectation for one statement of `kind`, or of any kind for
+  /// `None`, declared by the test at `location`.
+  pub(crate) fn new(kind: Option<StmtKind>, location: &'static Location<'static>) -> Self {
     Self {
       spec: Arc::new(Spec {
         kind,
@@ -79,47 +85,65 @@ impl Expectation {
       min: 1,
       max: 1,
       calls: 0,
+      location,
     }
   }
 
   /// The matching part, for builders to change. Nothing else holds it while
   /// expectations are set up, so this does not copy it.
-  pub fn spec_mut(&mut self) -> &mut Spec {
+  pub(crate) fn spec_mut(&mut self) -> &mut Spec {
     Arc::make_mut(&mut self.spec)
   }
 
   /// The response part, for builders.
-  pub fn response_mut(&mut self) -> &mut Response {
+  pub(crate) fn response_mut(&mut self) -> &mut Response {
     Arc::make_mut(&mut self.response)
   }
 
   /// Whether this expectation can still answer statements.
-  pub fn exhausted(&self) -> bool {
+  pub(crate) fn exhausted(&self) -> bool {
     self.calls >= self.max
   }
 
   /// Whether a result was scripted (transaction boundaries need none). Builders
   /// require one, but a pending builder can be dropped without one.
-  pub fn has_result(&self) -> bool {
+  pub(crate) fn has_result(&self) -> bool {
     let response = &self.response;
 
     self.spec.is_transaction() || response.rows.is_some() || response.exec.is_some() || response.error.is_some()
   }
 
   /// Whether this expectation was called enough.
-  pub fn satisfied(&self) -> bool {
+  pub(crate) fn satisfied(&self) -> bool {
     self.calls >= self.min
+  }
+
+  /// Expect `n` calls: exactly `n`, or up to `n` for an optional expectation
+  /// (see `maybe`). Works in either order: `.times(3).maybe()` and
+  /// `.maybe().times(3)` both allow 0 to 3 calls.
+  pub(crate) fn times(&mut self, n: usize) {
+    if self.min > 0 {
+      self.min = n;
+    }
+
+    self.max = n;
+  }
+
+  /// Make the expectation optional: it may be called up to its `times` (once
+  /// by default), or not at all.
+  pub(crate) fn maybe(&mut self) {
+    self.min = 0;
   }
 
   /// Stop matching statements. An ordered mock does this to the optional
   /// expectations it skips.
-  pub fn close(&mut self) {
+  pub(crate) fn close(&mut self) {
     self.max = self.calls;
   }
 
   /// The fixed exec result, to change its fields: created if missing, replacing
   /// any closure.
-  pub fn exec_mut(&mut self) -> &mut ProxyExecResult {
+  pub(crate) fn exec_mut(&mut self) -> &mut ProxyExecResult {
     let response = self.response_mut();
 
     if !matches!(response.exec, Some(Exec::Static(_))) {
@@ -132,13 +156,26 @@ impl Expectation {
     }
   }
 
+  /// Describe the expectation for failure messages, as it stands now: what it
+  /// accepts, how many calls it had, and where the test declared it.
+  pub(crate) fn declared(&self) -> Declared {
+    Declared {
+      label: self.label().to_string(),
+      location: self.location,
+    }
+  }
+
   /// A description of the expectation, for messages.
-  pub fn label(&self) -> Label<'_> {
-    Label {
-      spec: &self.spec,
-      calls: self.calls,
-      min: self.min,
-      max: self.max,
+  pub(crate) fn label(&self) -> Label<'_> {
+    Label(self)
+  }
+
+  /// Pair the expectation, as failures describe it, with why it rejected a
+  /// statement.
+  pub(crate) fn rejection(&self, mismatch: Mismatch) -> Rejection {
+    Rejection {
+      expectation: self.declared(),
+      mismatch,
     }
   }
 }
@@ -146,20 +183,18 @@ impl Expectation {
 impl Spec {
   /// Whether this expects a transaction boundary (`BEGIN`, `COMMIT` or
   /// `ROLLBACK`).
-  pub fn is_transaction(&self) -> bool {
+  pub(crate) fn is_transaction(&self) -> bool {
     self.kind.is_some_and(StmtKind::is_transaction)
   }
 
   /// Check an incoming statement against this expectation, returning why it
   /// does not match. This runs user closures (`sql_fn`, `Arg::matching`), so
   /// it must be called without holding the mock's lock.
-  pub fn check(&self, kind: StmtKind, stmt: &Statement, parsed: Option<&Parsed>) -> Result<(), String> {
+  pub(crate) fn check(&self, kind: StmtKind, stmt: &Statement, parsed: Option<&Parsed>) -> Result<(), Mismatch> {
     if let Some(expected) = self.kind
       && expected != kind
     {
-      let article = if matches!(expected, StmtKind::Insert | StmtKind::Update) { "an" } else { "a" };
-
-      return Err(format!("expected {article} {expected} statement, got {kind}"));
+      return Err(Mismatch::Kind { expected, actual: kind });
     }
 
     // Transaction expectations have nothing more to check; other ones (from
@@ -169,29 +204,36 @@ impl Spec {
     }
 
     if let Some(table) = &self.table {
-      let quoted = quote(stmt.db_backend, table);
+      let mismatch = |actual: Option<&str>| Mismatch::Table {
+        expected: table.clone(),
+        actual: actual.map(str::to_string),
+        backend: stmt.db_backend,
+      };
 
       // The parsed main table when known, otherwise any mention of the table.
       match parsed.and_then(|parsed| parsed.target.as_deref()) {
-        Some(target) if target != table => {
-          return Err(format!("it targets {}, not {quoted}", quote(stmt.db_backend, target)));
-        }
+        Some(target) if target != table => return Err(mismatch(Some(target))),
         Some(_) => {}
-        None if !stmt.sql.contains(&quoted) => return Err(format!("it does not reference table {quoted}")),
+        None if !stmt.sql.contains(&quote(stmt.db_backend, table)) => return Err(mismatch(None)),
         None => {}
       }
     }
 
     if let Some(matcher) = self.matchers.iter().find(|matcher| !matcher.matches(stmt, parsed)) {
-      let hint = matcher.hint(stmt, parsed).unwrap_or_default();
-
-      return Err(format!("it does not match {matcher}{hint}"));
+      return Err(Mismatch::Sql {
+        matcher: Box::new(matcher.clone()),
+        hint: matcher.hint(stmt, parsed),
+      });
     }
 
     if let Some(args) = &self.args
-      && !args_match(args, stmt)
+      && let Some(wrong) = wrong_args(args, stmt.args())
     {
-      return Err(format!("arguments {:?} do not match expected {args:?}", stmt.args()));
+      return Err(Mismatch::Args {
+        expected: args.clone(),
+        actual: stmt.args().to_vec(),
+        wrong,
+      });
     }
 
     Ok(())
@@ -201,7 +243,7 @@ impl Spec {
 impl Response {
   /// Whether this can answer a query: with rows, a primary key row, or an
   /// error.
-  pub fn has_rows(&self) -> bool {
+  pub(crate) fn has_rows(&self) -> bool {
     self.rows.is_some() || self.returning_pk.is_some() || self.error.is_some()
   }
 
@@ -210,7 +252,7 @@ impl Response {
   /// Rows built from `table`'s models are renamed to the aliases the statement
   /// selects (see `apply_aliases`). This runs user closures, so it must be
   /// called without holding the mock's lock.
-  pub fn query(&self, table: Option<&str>, stmt: &Statement, parsed: Option<&Parsed>) -> Result<Vec<ProxyRow>, DbErr> {
+  pub(crate) fn query(&self, table: Option<&str>, stmt: &Statement, parsed: Option<&Parsed>) -> Result<Vec<ProxyRow>, DbErr> {
     if let Some(err) = &self.error {
       return Err(err.clone());
     }
@@ -230,7 +272,7 @@ impl Response {
 
   /// Respond to a statement sent through `ConnectionTrait::execute`. This runs
   /// user closures, so it must be called without holding the mock's lock.
-  pub fn exec(&self, stmt: &Statement) -> Result<ProxyExecResult, DbErr> {
+  pub(crate) fn exec(&self, stmt: &Statement) -> Result<ProxyExecResult, DbErr> {
     if let Some(err) = &self.error {
       return Err(err.clone());
     }
@@ -245,17 +287,22 @@ impl Response {
   }
 }
 
-/// A description of an expectation and of its calls, for messages.
-pub(crate) struct Label<'a> {
-  pub spec: &'a Spec,
-  pub calls: usize,
-  pub min: usize,
-  pub max: usize,
-}
+/// A description of an expectation and of its calls, for messages: its kind,
+/// its table, its SQL matchers, its arguments, then its calls when it does
+/// not expect exactly one:
+///
+/// ```text
+/// DELETE on `cake` with any SQL
+/// SELECT on `cake` with SQL containing `ORDER BY` and args [Int(Some(1))] (1/2 calls)
+/// any statement with SQL equal to `TRUNCATE "cake"` (optional)
+/// BEGIN
+/// ```
+pub(crate) struct Label<'a>(&'a Expectation);
 
 impl fmt::Display for Label<'_> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    let spec = self.spec;
+    let Label(expectation) = self;
+    let spec = &expectation.spec;
 
     match spec.kind {
       None => write!(f, "any statement")?,
@@ -286,11 +333,11 @@ impl fmt::Display for Label<'_> {
       write!(f, " and args {args:?}")?;
     }
 
-    match (self.min, self.max) {
+    match (expectation.min, expectation.max) {
       (1, 1) => {}
       (0, 1) => write!(f, " (optional)")?,
-      (0, max) => write!(f, " ({}/up to {max} calls)", self.calls)?,
-      (_, max) => write!(f, " ({}/{max} calls)", self.calls)?,
+      (0, max) => write!(f, " ({}/up to {max} calls)", expectation.calls)?,
+      (_, max) => write!(f, " ({}/{max} calls)", expectation.calls)?,
     }
 
     Ok(())
@@ -299,6 +346,13 @@ impl fmt::Display for Label<'_> {
 
 pub(crate) fn into_proxy_row(row: impl IntoMockRow) -> ProxyRow {
   ProxyRow::new(row.into_mock_row().into_column_value_tuples().collect())
+}
+
+/// Wrap `f` into rows computed for each statement: `f` gets the statement and
+/// returns models (or other rows), which are converted into the rows the mock
+/// returns. Used by the `returning_with` methods.
+pub(crate) fn rows_with<R: IntoMockRow>(f: impl Fn(&Statement) -> Result<Vec<R>, DbErr> + Send + Sync + 'static) -> Rows {
+  Rows::Fn(Arc::new(move |stmt| Ok(f(stmt)?.into_iter().map(into_proxy_row).collect())))
 }
 
 /// Rename the columns of rows built from `table`'s models to the aliases the
@@ -355,11 +409,16 @@ fn apply_aliases(mut rows: Vec<ProxyRow>, table: &str, parsed: Option<&Parsed>) 
   rows
 }
 
+/// Describe a statement for plain-text messages: its SQL, with whitespace
+/// collapsed (see `normalize`), and its values:
+/// ``"`SELECT "id" FROM "cake" WHERE "id" = $1` with [Int(Some(1))]"``.
 pub(crate) fn describe(stmt: &Statement) -> String {
   format!("`{}` with {:?}", normalize(&stmt.sql, stmt.db_backend), stmt.args())
 }
 
-fn quote(backend: DbBackend, ident: &str) -> String {
+/// Quote an identifier as `backend` does in SQL: `cake` gives `"cake"`, or
+/// `` `cake` `` on MySQL.
+pub(crate) fn quote(backend: DbBackend, ident: &str) -> String {
   match backend {
     DbBackend::MySql => format!("`{ident}`"),
     _ => format!("\"{ident}\""),

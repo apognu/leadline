@@ -1,6 +1,6 @@
 [package]
 name = "leadline"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.94"
 description = "Scripted mock database for testing SeaORM"
@@ -12,9 +12,12 @@ keywords = ["sea-orm", "mock", "testing", "database", "orm"]
 categories = ["development-tools::testing", "database"]
 
 [dependencies]
+annotate-snippets = "0.12.16"
+anstyle-query = "1.1.5"
 async-trait = "0.1"
 regex = "1"
 sea-orm = { version = "2.0", default-features = false, features = ["proxy", "mock"] }
+similar = "3.2.0"
 sqlparser = { version = "0.63", default-features = false, features = ["std"] }
 
 [dev-dependencies]

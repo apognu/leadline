@@ -1,6 +1,7 @@
 use std::{
   error::Error,
   fmt,
+  panic::Location,
   sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -9,8 +10,10 @@ use sea_orm::{Database, DatabaseConnection, DbBackend, DbErr, EntityTrait, Proxy
 use crate::{
   builders::{ExecExpectation, QueryExpectation, SelectExpectation, TransactionExpectation},
   classify::{StmtKind, classify},
-  expectation::{Expectation, Label, Response, Spec, describe},
+  expectation::{Expectation, Response},
   parse::{Parsed, parse},
+  problem::{Mismatch, Problem, Reason},
+  render,
 };
 
 #[derive(Default)]
@@ -18,7 +21,7 @@ pub(crate) struct State {
   pub expectations: Vec<Expectation>,
   pub unordered: bool,
   pub strict_transactions: bool,
-  pub failures: Vec<String>,
+  pub failures: Vec<Problem>,
   pub log: Vec<Statement>,
   /// Incremented on every change: a statement received, an expectation added or
   /// changed, a call recorded. Matching compares it before and after running
@@ -30,46 +33,43 @@ pub(crate) struct State {
 }
 
 impl State {
-  /// The pending expectations, copied out of the state, so that a statement can
-  /// be checked against them without holding the lock: matchers may run user
-  /// code.
-  fn candidates(&self) -> Vec<Candidate> {
-    self
-      .expectations
-      .iter()
-      .enumerate()
-      .filter(|(_, e)| !e.exhausted())
-      .map(|(idx, e)| Candidate {
-        idx,
-        spec: e.spec.clone(),
-        calls: e.calls,
-        min: e.min,
-        max: e.max,
-      })
-      .collect()
+  /// Copy the pending expectations (those that can still be called) out of
+  /// the state, each with its index in `expectations`.
+  ///
+  /// A statement is checked against these copies without holding the lock,
+  /// because checking may run the user's closures (`sql_fn`, `Arg::matching`),
+  /// which may use the mock too. The copies are cheap: what an expectation
+  /// matches and answers is behind `Arc`s.
+  fn candidates(&self) -> Vec<(usize, Expectation)> {
+    self.expectations.iter().enumerate().filter(|(_, e)| !e.exhausted()).map(|(idx, e)| (idx, e.clone())).collect()
   }
 
-  /// Record that `stmt` was unexpected, and return the message describing it.
-  fn fail(&mut self, kind: StmtKind, stmt: &Statement, reason: &str) -> String {
-    let message = format!("unexpected {kind} {}: {reason}", describe(stmt));
-    self.failures.push(message.clone());
+  /// Record that no expectation answered `stmt`, for the report made when the
+  /// mock is checked, and return the problem, to panic with it now.
+  fn fail(&mut self, kind: StmtKind, stmt: &Statement, reason: Reason) -> Box<Problem> {
+    let problem = Problem::Unexpected { kind, stmt: stmt.clone(), reason };
 
-    message
+    self.failures.push(problem.clone());
+
+    Box::new(problem)
   }
 
+  /// List every problem found so far: the unexpected statements, in the order
+  /// they arrived, then the expectations without a result or not called
+  /// enough, in the order they were declared.
   fn report(&self) -> Result<(), MockError> {
     let mut problems = self.failures.clone();
     problems.extend(self.expectations.iter().filter_map(|e| {
       if !e.has_result() {
-        Some(format!("expectation has no result: {}", e.label()))
+        Some(Problem::NoResult(e.declared()))
       } else if !e.satisfied() {
-        Some(format!("expectation not met: {}", e.label()))
+        Some(Problem::Unmet(e.declared()))
       } else {
         None
       }
     }));
 
-    if problems.is_empty() { Ok(()) } else { Err(MockError(problems)) }
+    if problems.is_empty() { Ok(()) } else { Err(MockError::new(problems)) }
   }
 }
 
@@ -284,6 +284,7 @@ impl MockDb {
   /// assert_eq!(cake::Entity::find().all(&db).await.unwrap().len(), 1);
   /// # }
   /// ```
+  #[track_caller]
   pub fn expect_select<E: EntityTrait>(&self) -> SelectExpectation<E> {
     SelectExpectation::new(self.push_entity::<E>(StmtKind::Select), self.backend)
   }
@@ -312,6 +313,7 @@ impl MockDb {
   ///   .unwrap();
   /// # }
   /// ```
+  #[track_caller]
   pub fn expect_insert<E: EntityTrait>(&self) -> ExecExpectation<E> {
     ExecExpectation::new(self.push_entity::<E>(StmtKind::Insert), self.backend)
   }
@@ -342,6 +344,7 @@ impl MockDb {
   ///   .unwrap();
   /// # }
   /// ```
+  #[track_caller]
   pub fn expect_update<E: EntityTrait>(&self) -> ExecExpectation<E> {
     ExecExpectation::new(self.push_entity::<E>(StmtKind::Update), self.backend)
   }
@@ -367,6 +370,7 @@ impl MockDb {
   /// cake::Entity::delete_by_id(1).exec(&db).await.unwrap();
   /// # }
   /// ```
+  #[track_caller]
   pub fn expect_delete<E: EntityTrait>(&self) -> ExecExpectation<E> {
     ExecExpectation::new(self.push_entity::<E>(StmtKind::Delete), self.backend)
   }
@@ -395,8 +399,9 @@ impl MockDb {
   /// assert!(row.is_some());
   /// # }
   /// ```
+  #[track_caller]
   pub fn expect_query(&self) -> QueryExpectation {
-    QueryExpectation::new(self.push(Expectation::new(Some(StmtKind::Select))), self.backend)
+    QueryExpectation::new(self.push(Expectation::new(Some(StmtKind::Select), Location::caller())), self.backend)
   }
 
   /// Expect a statement of any kind, with untyped results.
@@ -419,8 +424,9 @@ impl MockDb {
   /// db.execute_unprepared(r#"CREATE INDEX "idx" ON "cake" ("name")"#).await.unwrap();
   /// # }
   /// ```
+  #[track_caller]
   pub fn expect_statement(&self) -> QueryExpectation {
-    QueryExpectation::new(self.push(Expectation::new(None)), self.backend)
+    QueryExpectation::new(self.push(Expectation::new(None, Location::caller())), self.backend)
   }
 
   /// Expect a transaction (or savepoint) to begin.
@@ -448,8 +454,9 @@ impl MockDb {
   /// tx.commit().await.unwrap();
   /// # }
   /// ```
+  #[track_caller]
   pub fn expect_begin(&self) -> TransactionExpectation {
-    TransactionExpectation::new(self.push(Expectation::new(Some(StmtKind::Begin))))
+    TransactionExpectation::new(self.push(Expectation::new(Some(StmtKind::Begin), Location::caller())))
   }
 
   /// Expect a transaction (or savepoint) to commit. See
@@ -471,8 +478,9 @@ impl MockDb {
   /// db.transaction::<_, _, DbErr>(|_tx| Box::pin(async { Ok(()) })).await.unwrap();
   /// # }
   /// ```
+  #[track_caller]
   pub fn expect_commit(&self) -> TransactionExpectation {
-    TransactionExpectation::new(self.push(Expectation::new(Some(StmtKind::Commit))))
+    TransactionExpectation::new(self.push(Expectation::new(Some(StmtKind::Commit), Location::caller())))
   }
 
   /// Expect a transaction (or savepoint) to roll back, explicitly or by being
@@ -504,8 +512,9 @@ impl MockDb {
   /// assert!(res.is_err());
   /// # }
   /// ```
+  #[track_caller]
   pub fn expect_rollback(&self) -> TransactionExpectation {
-    TransactionExpectation::new(self.push(Expectation::new(Some(StmtKind::Rollback))))
+    TransactionExpectation::new(self.push(Expectation::new(Some(StmtKind::Rollback), Location::caller())))
   }
 
   /// Every statement received so far, in order, expected or not.
@@ -598,12 +607,13 @@ impl MockDb {
   #[track_caller]
   pub fn verify(&self) {
     if let Err(err) = self.check() {
-      panic!("{err}");
+      panic!("{}", err.report(render::colors()));
     }
   }
 
+  #[track_caller]
   fn push_entity<E: EntityTrait>(&self, kind: StmtKind) -> ExpectationRef {
-    let mut expectation = Expectation::new(Some(kind));
+    let mut expectation = Expectation::new(Some(kind), Location::caller());
     expectation.spec_mut().table = Some(E::default().table_name().to_string());
 
     self.push(expectation)
@@ -632,7 +642,7 @@ pub(crate) struct ExpectationRef {
 }
 
 impl ExpectationRef {
-  pub fn update(&self, f: impl FnOnce(&mut Expectation)) {
+  pub(crate) fn update(&self, f: impl FnOnce(&mut Expectation)) {
     let mut state = lock(&self.state);
     state.revision += 1;
 
@@ -661,15 +671,24 @@ impl Drop for DropCheck {
 
     if let Err(err) = state.report() {
       drop(state);
-      panic!("{err}");
+      panic!("{}", err.report(render::colors()));
     }
   }
 }
 
-/// The problems found by [`MockDb::check`], one message per problem.
+/// The problems found by [`MockDb::check`]: unexpected statements, and
+/// expectations without a result or not met.
 ///
-/// Its `Display` lists them all: it is the report [`MockDb::verify`] panics
-/// with, as does the check run when the mock is dropped.
+/// There are two ways to read them:
+///
+/// - [`problems`](Self::problems) gives one plain-text message for each
+///   problem, with all its details. This is what a test checking a failure
+///   should assert on.
+/// - `Display` gives the report that [`MockDb::verify`], and the check run
+///   when the mock is dropped, panic with: a line counting the problems, a
+///   line summing up each one, then a diagnostic for each one, in the style
+///   of the Rust compiler's errors. `Display` never uses colors; the panics
+///   do, when stderr and stdout are terminals.
 ///
 /// ```
 /// # include!("../doctests/entities.rs");
@@ -683,18 +702,27 @@ impl Drop for DropCheck {
 ///
 /// let err = mock.check().unwrap_err();
 /// assert_eq!(err.problems().len(), 1);
-/// assert!(err.to_string().starts_with("leadline: 1 problem(s):"));
+/// assert!(err.to_string().starts_with("leadline: 1 problem:\n  - expectation not met: DELETE on `cake`"));
 /// # }
 /// ```
-#[derive(Debug)]
-pub struct MockError(Vec<String>);
+pub struct MockError {
+  pub(crate) problems: Vec<Problem>,
+  messages: Vec<String>,
+}
 
 impl MockError {
-  /// The message of each problem, in the order they were found: unexpected
-  /// statements first, then expectations without a result or not met.
+  /// The message of each problem, in plain text: the unexpected statements
+  /// first, in the order they arrived, then the expectations without a result
+  /// or not met, in the order they were declared.
   ///
-  /// Useful to assert on a specific problem, where `Display` gives the whole
-  /// report.
+  /// Each message gives the full details on one line (or more, when several
+  /// expectations rejected a statement), without colors, which makes it the
+  /// thing to assert on in a test checking a failure:
+  ///
+  /// ```text
+  /// unexpected SELECT `SELECT "cake"."id" FROM "cake"` with []: the next expectation does not match it (DELETE on `cake` with any SQL): expected a DELETE statement, got SELECT
+  /// expectation not met: DELETE on `cake` with any SQL
+  /// ```
   ///
   /// ```
   /// # include!("../doctests/entities.rs");
@@ -711,19 +739,57 @@ impl MockError {
   /// # }
   /// ```
   pub fn problems(&self) -> &[String] {
-    &self.0
+    &self.messages
+  }
+
+  fn new(problems: Vec<Problem>) -> Self {
+    let messages = problems.iter().map(Problem::to_string).collect();
+
+    Self { problems, messages }
+  }
+
+  /// Write the report on the problems. `Display` gives it without colors. The
+  /// panics of `verify` and of the drop check give it in color when
+  /// `render::colors` allows it:
+  ///
+  /// ```text
+  /// leadline: 2 problems:
+  ///   - unexpected SELECT: no expectation was set
+  ///   - expectation not met: DELETE on `cake` with any SQL
+  ///
+  /// error: unexpected SELECT
+  /// … (a diagnostic for each problem, see `render::render`)
+  /// ```
+  ///
+  /// The first lines stay plain even with `colors`, so that
+  /// `#[should_panic(expected = …)]` and searches find them.
+  pub(crate) fn report(&self, colors: bool) -> String {
+    let count = self.problems.len();
+    let plural = if count == 1 { "" } else { "s" };
+
+    // The summaries stay plain, for `should_panic` and searches.
+    let mut report = format!("leadline: {count} problem{plural}:\n");
+
+    for problem in &self.problems {
+      report.push_str(&format!("  - {}\n", problem.headline()));
+    }
+
+    report.push('\n');
+    report.push_str(&render::render(&self.problems, colors));
+
+    report
   }
 }
 
 impl fmt::Display for MockError {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    writeln!(f, "leadline: {} problem(s):", self.0.len())?;
+    f.write_str(&self.report(false))
+  }
+}
 
-    for problem in &self.0 {
-      writeln!(f, "  - {problem}")?;
-    }
-
-    Ok(())
+impl fmt::Debug for MockError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_tuple("MockError").field(&self.messages).finish()
   }
 }
 
@@ -744,16 +810,21 @@ impl fmt::Debug for State {
 }
 
 impl Handler {
-  /// Find the expectation answering `stmt`, and compute its response with
-  /// `respond`; `unscripted` answers ignored transaction boundaries. Fails the
-  /// test if no expectation answers.
+  /// Find the expectation answering `stmt`, and compute the response with
+  /// `answer`, which gets that expectation. Fails the test if no expectation
+  /// answers `stmt`.
+  ///
+  /// `unscripted` is the response to a `BEGIN`, `COMMIT` or `ROLLBACK` sent
+  /// as SQL (as with `execute_unprepared("BEGIN")`) while transactions are not
+  /// checked (see `MockDb::strict_transactions`): no expectation answers it,
+  /// and it gets this empty response instead of failing the test.
   ///
   /// `reads_rows` tells whether the statement was sent through
   /// `ConnectionTrait::query_*`, which reads rows back. A write sent there,
   /// such as `INSERT … RETURNING`, needs an expectation with rows: one with
   /// only an exec result (`rows_affected`) fails the test with an explanation,
   /// rather than silently returning no rows.
-  fn respond<T>(&self, stmt: Statement, reads_rows: bool, respond: impl FnOnce(&Selected, &Statement, Option<&Parsed>) -> Result<T, DbErr>, unscripted: T) -> Result<T, DbErr> {
+  fn respond<T>(&self, stmt: Statement, reads_rows: bool, answer: impl FnOnce(&Selected, &Statement, Option<&Parsed>) -> Result<T, DbErr>, unscripted: T) -> Result<T, DbErr> {
     // Parsing gives the kind of data-modifying CTEs (`WITH … DELETE`) too;
     // the leading keyword is the fallback for SQL that does not parse.
     let parsed = parse(&stmt);
@@ -767,35 +838,42 @@ impl Handler {
           (false, _) => "`.returning_rows(..)` (an empty list for none)",
         };
 
-        let reason = format!("it reads the written rows back (`RETURNING` on this backend), but its expectation has no rows to return: complete it with {fix}");
-        let message = lock(&self.state).fail(kind, &stmt, &reason);
+        let problem = lock(&self.state).fail(kind, &stmt, Reason::MissingRows { fix });
 
-        unexpected(message)
+        Err(unexpected(problem))
       }
       // The response may call user code: the lock is not held anymore.
-      Ok(Some(selected)) => respond(&selected, &stmt, parsed.as_ref()),
+      Ok(Some(selected)) => answer(&selected, &stmt, parsed.as_ref()),
       Ok(None) => Ok(unscripted),
-      Err(message) => unexpected(message),
+      Err(problem) => Err(unexpected(problem)),
     }
   }
 
+  /// Handle a transaction boundary: `BEGIN`, `COMMIT` or `ROLLBACK`. It is
+  /// matched like a statement whose SQL is its keyword.
   fn transaction(&self, kind: StmtKind) {
     let stmt = Statement::from_string(self.backend, kind.to_string());
 
-    if let Err(message) = self.select(kind, &stmt, None) {
-      let _ = unexpected::<()>(message);
+    // Transaction boundaries cannot return an error: the problem is recorded
+    // for the report anyway.
+    if let Err(problem) = self.select(kind, &stmt, None) {
+      unexpected(problem);
     }
   }
 
-  /// Find the expectation answering `stmt`, record the call, and return its
-  /// response. Returns `None` for an ignored transaction boundary. On failure,
-  /// records and returns why no expectation matched.
+  /// Log `stmt`, find the expectation answering it, record the call, and
+  /// return that expectation's response.
+  ///
+  /// Returns `Ok(None)` for a transaction boundary that is not checked (see
+  /// `MockDb::strict_transactions`) and that no expectation matches. Fails
+  /// when no expectation matches `stmt`, or when the one that matches has no
+  /// result: the problem is then recorded for the report, and returned.
   ///
   /// Matchers may run user code (`sql_fn`, `Arg::matching`), which may call the
   /// mock and take its lock. So the statement is matched against a copy of the
   /// pending expectations, without the lock. If the expectations changed in the
   /// meantime, the statement is matched again against the new ones.
-  fn select(&self, kind: StmtKind, stmt: &Statement, parsed: Option<&Parsed>) -> Result<Option<Selected>, String> {
+  fn select(&self, kind: StmtKind, stmt: &Statement, parsed: Option<&Parsed>) -> Result<Option<Selected>, Box<Problem>> {
     // Until transactions are checked, a transaction statement is answered by
     // an expectation matching it, and ignored otherwise.
     let unchecked_transaction = {
@@ -812,11 +890,7 @@ impl Handler {
         (state.candidates(), state.expectations.len(), state.unordered, state.revision)
       };
 
-      let choice = if unordered {
-        choose_unordered(&candidates, total, kind, stmt, parsed)
-      } else {
-        choose_ordered(&candidates, total, kind, stmt, parsed)
-      };
+      let choice = choose(&candidates, total, unordered, kind, stmt, parsed);
 
       let mut state = lock(&self.state);
 
@@ -827,13 +901,13 @@ impl Handler {
       let (idx, skipped) = match choice {
         Ok(choice) => choice,
         Err(_) if unchecked_transaction => return Ok(None),
-        Err(reason) => return Err(state.fail(kind, stmt, &reason)),
+        Err(reason) => return Err(state.fail(kind, stmt, reason)),
       };
 
       if !state.expectations[idx].has_result() {
-        let reason = format!("it matches {}, which has no result", state.expectations[idx].label());
+        let reason = Reason::MatchedWithoutResult(state.expectations[idx].declared());
 
-        return Err(state.fail(kind, stmt, &reason));
+        return Err(state.fail(kind, stmt, reason));
       }
 
       for idx in skipped {
@@ -860,103 +934,85 @@ struct Selected {
   table: Option<String>,
 }
 
-/// A pending expectation, as it stood when a statement arrived.
-struct Candidate {
-  idx: usize,
-  spec: Arc<Spec>,
-  calls: usize,
-  min: usize,
-  max: usize,
-}
-
-impl Candidate {
-  fn satisfied(&self) -> bool {
-    self.calls >= self.min
-  }
-
-  fn label(&self) -> Label<'_> {
-    Label {
-      spec: &self.spec,
-      calls: self.calls,
-      min: self.min,
-      max: self.max,
-    }
-  }
-}
-
-/// The first pending expectation matching `stmt`, in any order.
-fn choose_unordered(candidates: &[Candidate], total: usize, kind: StmtKind, stmt: &Statement, parsed: Option<&Parsed>) -> Result<(usize, Vec<usize>), String> {
-  let mut mismatches = Vec::new();
-
-  for candidate in candidates {
-    match candidate.spec.check(kind, stmt, parsed) {
-      Ok(()) => return Ok((candidate.idx, Vec::new())),
-      Err(reason) => mismatches.push(format!("{}: {reason}", candidate.label())),
-    }
-  }
-
-  Err(no_match(total, &mismatches, "pending"))
-}
-
-/// Find the expectation answering `stmt` in an ordered mock: the first pending
-/// expectation must match.
+/// Find the expectation answering `stmt` among the pending ones (`candidates`,
+/// with their index), and return its index, with the indexes of the
+/// expectations it skipped, which the caller closes. `total` is the number of
+/// expectations, pending or not.
 ///
-/// An expectation already satisfied (optional, or `times(n)` with enough calls)
-/// can be skipped when it does not match, and the next one is tried. With an
-/// optional `SELECT` expected before a `DELETE`, a `DELETE` skips the `SELECT`,
-/// but an `UPDATE` fails, as the `DELETE` does not match it either. Returns the
-/// matching expectation, and the skipped ones, which the caller closes.
-fn choose_ordered(candidates: &[Candidate], total: usize, kind: StmtKind, stmt: &Statement, parsed: Option<&Parsed>) -> Result<(usize, Vec<usize>), String> {
+/// An unordered mock takes the first pending expectation that matches, and
+/// skips none.
+///
+/// An ordered mock requires the next pending expectation to match. It may
+/// skip that one only if it is already satisfied (optional, or `times(n)`
+/// with enough calls), and try the one after it, and so on. With an optional
+/// `SELECT` expected before a `DELETE`:
+///
+/// - a `DELETE` skips the `SELECT` and matches the `DELETE`: the `SELECT` is
+///   closed, and will not match later statements;
+/// - an `UPDATE` fails: it matches neither of them.
+fn choose(candidates: &[(usize, Expectation)], total: usize, unordered: bool, kind: StmtKind, stmt: &Statement, parsed: Option<&Parsed>) -> Result<(usize, Vec<usize>), Reason> {
   let mut skipped = Vec::new();
-  let mut mismatches = Vec::new();
+  let mut rejections = Vec::new();
 
-  for candidate in candidates {
+  for (idx, candidate) in candidates {
     match candidate.spec.check(kind, stmt, parsed) {
-      Ok(()) => return Ok((candidate.idx, skipped)),
+      Ok(()) => return Ok((*idx, skipped)),
 
-      Err(reason) if candidate.satisfied() => {
-        skipped.push(candidate.idx);
-        mismatches.push(format!("{}: {reason}", candidate.label()));
+      Err(mismatch) if unordered || candidate.satisfied() => {
+        // Expectations an unordered mock passes over stay pending.
+        if !unordered {
+          skipped.push(*idx);
+        }
+
+        rejections.push((candidate, mismatch));
       }
 
-      Err(reason) => return Err(format!("next expectation is {}, but {reason}", candidate.label())),
+      Err(mismatch) => return Err(Reason::Next(candidate.rejection(mismatch))),
     }
   }
 
-  Err(no_match(total, &mismatches, "remaining optional"))
+  Err(no_match(total, rejections, if unordered { "pending" } else { "remaining optional" }))
 }
 
-/// Explain why no expectation answered a statement, given the number of
-/// expectations and why each candidate did not match.
-fn no_match(total: usize, mismatches: &[String], candidates: &str) -> String {
-  if total == 0 {
-    return "no expectation was set".to_string();
-  }
-
-  if mismatches.is_empty() {
-    return "every expectation was already consumed".to_string();
-  }
-
-  let mut message = format!("none of the {candidates} expectations matches it:");
-
-  for mismatch in mismatches {
-    message.push_str(&format!("\n      - {mismatch}"));
-  }
-
-  message
-}
-
-/// Fail the test with `message`, by panicking.
+/// Tell why no expectation answered a statement:
 ///
-/// When the thread is already panicking, as when a transaction is rolled back
-/// on drop during a failing test, a second panic would abort the process: this
-/// returns an error instead. The failure is recorded for the report anyway.
-fn unexpected<T>(message: String) -> Result<T, DbErr> {
+/// - `NoExpectation` when the mock has no expectations at all (`total` is 0);
+/// - `Consumed` when none of them was pending, so that no candidate could
+///   reject the statement (`rejections` is empty);
+/// - `NoneMatched` otherwise, with each candidate and why it rejected the
+///   statement. `candidates` names them in messages: `"pending"` or
+///   `"remaining optional"`.
+///
+/// The rejections are only described here, once the statement has failed:
+/// describing an expectation can mean tokenizing its SQL, and most
+/// rejections are followed by a match, which does not need them.
+fn no_match(total: usize, rejections: Vec<(&Expectation, Mismatch)>, candidates: &'static str) -> Reason {
+  if total == 0 {
+    Reason::NoExpectation
+  } else if rejections.is_empty() {
+    Reason::Consumed
+  } else {
+    let rejections = rejections.into_iter().map(|(candidate, mismatch)| candidate.rejection(mismatch)).collect();
+
+    Reason::NoneMatched { candidates, rejections }
+  }
+}
+
+/// Fail the test with `problem`, by panicking with its headline and its
+/// diagnostic.
+///
+/// When the thread is already panicking, panicking again would abort the
+/// process. That happens when a failing test drops a transaction, which rolls
+/// it back. Then this returns an error instead, for the code under test to
+/// get. The problem was already recorded, and is reported with the others.
+fn unexpected(problem: Box<Problem>) -> DbErr {
   if !std::thread::panicking() {
-    panic!("leadline: {message}");
+    // A plain headline comes first, for `should_panic` and searches; the
+    // rendered diagnostic, possibly in color, gives the details.
+    panic!("leadline: {}\n\n{}", problem.headline(), render::render(std::slice::from_ref(problem.as_ref()), render::colors()));
   }
 
-  Err(DbErr::Custom(format!("leadline: {message}")))
+  DbErr::Custom(format!("leadline: {problem}"))
 }
 
 #[async_trait::async_trait]

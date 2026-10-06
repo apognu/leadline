@@ -3,8 +3,11 @@
 
 mod common;
 
-use common::cake::{self, cake};
 use common::schema::filling;
+use common::{
+  cake::{self, cake},
+  problems,
+};
 use leadline::{Any, MockDb};
 use sea_orm::{ColumnTrait, DbBackend, EntityTrait, QueryFilter, QuerySelect};
 
@@ -38,7 +41,7 @@ async fn select_all_with_sql_and_args() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "but it does not match statement")]
+#[should_panic(expected = "leadline: unexpected SELECT: the next expectation does not match it")]
 async fn mismatched_query_fails_the_test() {
   let mock = MockDb::new(DbBackend::Postgres);
 
@@ -52,14 +55,18 @@ async fn mismatched_query_fails_the_test() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "use `matching_ignoring_limit`")]
 async fn strict_match_hints_at_limit() {
   let mock = MockDb::new(DbBackend::Postgres);
 
   mock.expect_select::<cake::Entity>().matching(cake::Entity::find_by_id(1)).returning([cake(1, "Chocolate")]);
 
   let db = mock.connection().await;
-  let _ = cake::Entity::find_by_id(1).one(&db).await;
+  let problems = problems(&mock, async move {
+    let _ = cake::Entity::find_by_id(1).one(&db).await;
+  })
+  .await;
+
+  assert!(problems[0].contains("use `matching_ignoring_limit`"), "{problems:?}");
 }
 
 #[tokio::test]
@@ -111,13 +118,20 @@ async fn delete_with_specific_filters() {
 }
 
 #[tokio::test]
-#[should_panic(expected = r#"but it does not match statement `DELETE FROM "cake" WHERE "cake"."id" = $1` with [Int(Some(7))]"#)]
 async fn delete_with_wrong_filter_fails() {
   let mock = MockDb::new(DbBackend::Postgres);
   mock.expect_delete::<cake::Entity>().matching(cake::Entity::delete_by_id(7)).rows_affected(1);
 
   let db = mock.connection().await;
-  let _ = cake::Entity::delete_by_id(8).exec(&db).await;
+  let problems = problems(&mock, async move {
+    let _ = cake::Entity::delete_by_id(8).exec(&db).await;
+  })
+  .await;
+
+  assert!(
+    problems[0].contains(r#"): it does not match statement `DELETE FROM "cake" WHERE "cake"."id" = $1` with [Int(Some(7))]"#),
+    "{problems:?}"
+  );
 }
 
 #[tokio::test]
@@ -135,7 +149,6 @@ async fn sql_matchers_accumulate() {
 }
 
 #[tokio::test]
-#[should_panic(expected = r#"with SQL containing `FROM "cake"` and SQL containing `ORDER BY`, but it does not match SQL containing `ORDER BY`"#)]
 async fn every_sql_matcher_must_match() {
   let mock = MockDb::new(DbBackend::Postgres);
 
@@ -147,17 +160,29 @@ async fn every_sql_matcher_must_match() {
     .returning::<cake::Model>([]);
 
   let db = mock.connection().await;
-  let _ = cake::Entity::find().all(&db).await;
+  let problems = problems(&mock, async move {
+    let _ = cake::Entity::find().all(&db).await;
+  })
+  .await;
+
+  assert!(
+    problems[0].contains(r#"with SQL containing `FROM "cake"` and SQL containing `ORDER BY`): it does not match SQL containing `ORDER BY`"#),
+    "{problems:?}"
+  );
 }
 
 #[tokio::test]
-#[should_panic(expected = r#"it targets "cake", not "filling""#)]
 async fn wrong_entity_is_rejected() {
   let mock = MockDb::new(DbBackend::Postgres);
   mock.expect_select::<filling::Entity>().returning::<filling::Model>([]);
 
   let db = mock.connection().await;
-  let _ = cake::Entity::find().all(&db).await;
+  let problems = problems(&mock, async move {
+    let _ = cake::Entity::find().all(&db).await;
+  })
+  .await;
+
+  assert!(problems[0].contains("it targets `cake`, not `filling`"), "{problems:?}");
 }
 
 #[tokio::test]

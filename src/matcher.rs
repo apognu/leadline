@@ -1,36 +1,41 @@
-use std::{
-  fmt,
-  sync::{Arc, LazyLock},
-};
+use std::{fmt, sync::Arc};
 
 use regex::Regex;
 use sea_orm::{DbBackend, Statement, Value, sea_query::ValueType};
-use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
+use sqlparser::tokenizer::{Token, Whitespace};
 
-use crate::parse::{Parsed, dialect, parse};
+use crate::parse::{Parsed, parse, tokens};
 
 type StmtPredicate = Arc<dyn Fn(&Statement) -> bool + Send + Sync>;
 type ValuePredicate = Arc<dyn Fn(&Value) -> bool + Send + Sync>;
 
 /// How the SQL text of an incoming statement is compared to an expectation.
 #[derive(Clone)]
-pub enum SqlMatcher {
-  /// The same SQL, ignoring formatting (see `normalize`).
+pub(crate) enum SqlMatcher {
+  /// The same SQL, ignoring whitespace (see `normalize`). Set by `sql(..)`.
   Exact(String),
-  /// SQL matching a regular expression, formatting included.
+  /// SQL matching a regular expression, as sent, whitespace included. Set by
+  /// `sql_regex(..)`.
   Regex(Regex),
-  /// SQL containing a fragment, ignoring formatting.
+  /// SQL containing a fragment, ignoring whitespace. Set by `sql_contains(..)`.
   Contains(String),
-  /// The same statement: the same SQL, ignoring formatting, and the same bound
-  /// values. With `ignore_limit`, `LIMIT` and `OFFSET` are ignored (see
-  /// `same_unpaginated`); `unpaginated` holds the expected statement without
-  /// them, computed once, when the expectation is set up.
+  /// The same statement: the same SQL, ignoring whitespace, and the same
+  /// bound values (see `same_statement`). Set by `matching(..)`,
+  /// `matching_query(..)` and `matching_statement(..)`.
+  ///
+  /// With `ignore_limit` (set by `matching_ignoring_limit(..)`), `LIMIT` and
+  /// `OFFSET` are ignored, with the values bound to them (see
+  /// `same_unpaginated`). `unpaginated` is the expected statement without
+  /// them: its SQL, as sqlparser writes it back, and its remaining values. It
+  /// is computed once, when the expectation is declared, rather than for
+  /// every statement received, and is `None` when the statement does not
+  /// parse.
   Statement {
     stmt: Statement,
     ignore_limit: bool,
     unpaginated: Option<(String, Vec<Value>)>,
   },
-  /// Arbitrary predicate.
+  /// SQL accepted by a closure. Set by `sql_fn(..)`.
   Fn(StmtPredicate),
 }
 
@@ -53,7 +58,7 @@ impl SqlMatcher {
       SqlMatcher::Contains(needle) => normalize(&stmt.sql, stmt.db_backend).contains(&normalize(needle, stmt.db_backend)),
       SqlMatcher::Statement {
         stmt: expected, ignore_limit: false, ..
-      } => normalize(&expected.sql, expected.db_backend) == normalize(&stmt.sql, stmt.db_backend) && expected.args() == stmt.args(),
+      } => same_statement(expected, stmt),
       SqlMatcher::Statement {
         stmt: expected,
         ignore_limit: true,
@@ -63,22 +68,26 @@ impl SqlMatcher {
     }
   }
 
-  /// A likely cause of a mismatch, added to the failure message. For now, only
-  /// a statement that differs from the expected one by its `LIMIT` or `OFFSET`
-  /// gets one, suggesting `matching_ignoring_limit`.
+  /// A likely cause for this matcher rejecting `stmt`, added to the failure
+  /// message. For now, there is one: for a `matching(..)` matcher, when `stmt`
+  /// only differs from the expected statement by its `LIMIT` or `OFFSET`, the
+  /// hint suggests `matching_ignoring_limit`.
   pub(crate) fn hint(&self, stmt: &Statement, parsed: Option<&Parsed>) -> Option<&'static str> {
     match self {
       SqlMatcher::Statement {
         stmt: expected,
         ignore_limit: false,
         unpaginated,
-      } if same_unpaginated(expected, unpaginated.as_ref(), stmt, parsed) => Some(
-        " (they only differ by LIMIT/OFFSET, which `.one()` and paginators add: \
-         use `matching_ignoring_limit`)",
-      ),
+      } if same_unpaginated(expected, unpaginated.as_ref(), stmt, parsed) => Some("they only differ by LIMIT/OFFSET, which `.one()` and paginators add: use `matching_ignoring_limit`"),
       _ => None,
     }
   }
+}
+
+/// Whether two statements are the same: the same SQL, ignoring whitespace
+/// (see `normalize`), and the same bound values, of the same types.
+fn same_statement(expected: &Statement, stmt: &Statement) -> bool {
+  normalize(&expected.sql, expected.db_backend) == normalize(&stmt.sql, stmt.db_backend) && expected.args() == stmt.args()
 }
 
 /// Whether two statements are equal once their `LIMIT` and `OFFSET` clauses,
@@ -90,46 +99,20 @@ impl SqlMatcher {
 /// compared   SELECT … WHERE "id" = $1             [1]      → equal
 /// ```
 ///
-/// `expected_unpaginated` and `parsed` are the two statements, already parsed
-/// if they parse.
+/// `expected_unpaginated` is the expected statement already without them (see
+/// `SqlMatcher::Statement`), and `parsed` the received statement, parsed.
+/// Either is `None` when its statement does not parse. Parsing finds `LIMIT`
+/// and `OFFSET` wherever they are, including before a row lock, as in
+/// `SELECT … LIMIT $2 FOR UPDATE`, which SeaORM sends for
+/// `.lock_exclusive().one(db)`.
 ///
-/// - If both statements parse, `LIMIT` and `OFFSET` are removed from the parsed
-///   statements, wherever they are. That includes a `LIMIT` followed by a row
-///   lock, as in `SELECT … LIMIT $2 FOR UPDATE`, which SeaORM sends for
-///   `.lock_exclusive().one(db)`.
-/// - Otherwise, `LIMIT` and `OFFSET` are only removed when they end the SQL
-///   (see `strip_trailing_pagination`). They are removed this way from both
-///   statements, so that the two are still compared the same way.
+/// Unless both statements parse, `LIMIT` and `OFFSET` cannot be told apart from
+/// the rest of the SQL: the statements are compared as they are.
 fn same_unpaginated(expected: &Statement, expected_unpaginated: Option<&(String, Vec<Value>)>, stmt: &Statement, parsed: Option<&Parsed>) -> bool {
   match (expected_unpaginated, parsed) {
     (Some(expected), Some(actual)) => *expected == actual.unpaginated,
-    _ => strip_trailing_pagination(expected) == strip_trailing_pagination(stmt),
+    _ => same_statement(expected, stmt),
   }
-}
-
-/// Remove the `LIMIT` and `OFFSET` clauses at the end of a statement, with the
-/// values bound to them: `… WHERE "id" = $1 LIMIT $2 OFFSET $3` with `[1, 10,
-/// 20]` becomes `… WHERE "id" = $1` with `[1]`.
-///
-/// This is the fallback for statements that do not parse, and only removes
-/// `LIMIT` and `OFFSET` when they end the SQL. SQL allows a row lock after them,
-/// as in `SELECT … LIMIT $2 FOR UPDATE`: that `LIMIT` is kept.
-fn strip_trailing_pagination(stmt: &Statement) -> (String, Vec<Value>) {
-  static TRAILING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\s+(?:LIMIT|OFFSET)\s+(\$\d+|\?|\d+)\s*$").unwrap());
-
-  let mut sql = normalize(&stmt.sql, stmt.db_backend);
-  let mut values = stmt.args().to_vec();
-
-  while let Some(captures) = TRAILING.captures(&sql) {
-    // Placeholders are bound last, literals are not bound at all.
-    if !captures[1].starts_with(|c: char| c.is_ascii_digit()) {
-      values.pop();
-    }
-
-    sql.truncate(captures.get(0).unwrap().start());
-  }
-
-  (sql, values)
 }
 
 impl fmt::Display for SqlMatcher {
@@ -224,7 +207,21 @@ impl Arg {
     Arg(ArgMatcher::Fn(Arc::new(predicate)))
   }
 
-  fn matches(&self, value: &Value) -> bool {
+  /// The value this argument must equal, if it is a plain value: `Some` for
+  /// `7` in `with_args((7, Any))`, `None` for `Any` and `Arg::matching`.
+  pub(crate) fn value(&self) -> Option<&Value> {
+    match &self.0 {
+      ArgMatcher::Eq(value) => Some(value),
+      _ => None,
+    }
+  }
+
+  /// Whether this argument is [`Any`], which accepts any value.
+  pub(crate) fn is_any(&self) -> bool {
+    matches!(self.0, ArgMatcher::Any)
+  }
+
+  pub(crate) fn matches(&self, value: &Value) -> bool {
     match &self.0 {
       ArgMatcher::Eq(expected) => expected == value || matches!((integer(expected), integer(value)), (Some(lhs), Some(rhs)) if lhs == rhs),
       ArgMatcher::Any => true,
@@ -243,25 +240,23 @@ impl fmt::Debug for Arg {
   }
 }
 
-/// A value accepted for one argument by
-/// [`with_args`](crate::SelectExpectation::with_args):
-///
-/// - anything convertible into a [`Value`], which matches an equal value;
-/// - [`Any`], which matches any value;
-/// - an [`Arg`], for a custom check.
-///
-/// This trait is sealed: it cannot be implemented outside of leadline.
-pub trait IntoArg: sealed::IntoArg {}
-
-impl<T: sealed::IntoArg> IntoArg for T {}
-
 /// A list of arguments accepted by
 /// [`with_args`](crate::SelectExpectation::with_args):
 ///
-/// - a tuple of up to 8 [`IntoArg`]s, which may have different types: `(1, Any,
+/// - a tuple of up to 8 arguments, which may have different types: `(1, Any,
 ///   "Lemon")`. A tuple of one argument needs a trailing comma: `(1,)`;
-/// - a `Vec` of one [`IntoArg`] type, for long lists: `vec![1, 2, 3, 4]`;
+/// - a `Vec` of arguments of one type, for long lists: `vec![1, 2, 3, 4]`;
 /// - `()`, for no arguments.
+///
+/// Each argument is one of:
+///
+/// - anything convertible into a [`Value`], which matches an equal value.
+///   Integers are equal whatever their width: `1`, an `i32`, matches the
+///   `i64` value of a `BIGINT` column. Other values must also have the same
+///   type: `"1"` does not match `1`;
+/// - [`Any`], which matches any value;
+/// - an [`Arg`] built with [`Arg::matching`], which matches the values its
+///   closure accepts.
 ///
 /// This trait is sealed: it cannot be implemented outside of leadline.
 ///
@@ -285,8 +280,8 @@ pub trait IntoArgs: sealed::IntoArgs {}
 
 impl<T: sealed::IntoArgs> IntoArgs for T {}
 
-/// The conversions behind [`IntoArg`] and [`IntoArgs`], kept out of the
-/// public API.
+/// The conversions behind [`IntoArgs`], kept out of the public API: `IntoArg`
+/// turns one argument into an [`Arg`], and `IntoArgs` a list of them.
 pub(crate) mod sealed {
   use sea_orm::Value;
 
@@ -372,10 +367,27 @@ pub(crate) fn integer(value: &Value) -> Option<Option<i128>> {
   })
 }
 
-pub(crate) fn args_match(expected: &[Arg], stmt: &Statement) -> bool {
-  let actual = stmt.args();
+/// Find the bound values that do not match the arguments of `with_args`.
+///
+/// Returns `None` when every value matches the argument at its position.
+/// Otherwise, returns the positions of the values that do not: with
+/// `with_args((7, Any))` and the values `[8, 'Lemon']`, `Some(vec![0])`. When
+/// there are not as many values as arguments, they cannot be compared one by
+/// one, and the result is `Some(vec![])`.
+pub(crate) fn wrong_args(expected: &[Arg], actual: &[Value]) -> Option<Vec<usize>> {
+  if expected.len() != actual.len() {
+    return Some(Vec::new());
+  }
 
-  expected.len() == actual.len() && expected.iter().zip(actual).all(|(arg, value)| arg.matches(value))
+  let wrong: Vec<usize> = expected
+    .iter()
+    .zip(actual)
+    .enumerate()
+    .filter(|(_, (arg, value))| !arg.matches(value))
+    .map(|(index, _)| index)
+    .collect();
+
+  (!wrong.is_empty()).then_some(wrong)
 }
 
 /// Typed access to the values bound to a [`Statement`].
@@ -457,19 +469,16 @@ impl StatementExt for Statement {
 /// SQL that does not tokenize, such as a fragment ending inside a quote, is
 /// normalized by `normalize_text` instead.
 pub(crate) fn normalize(sql: &str, backend: DbBackend) -> String {
-  let Ok(tokens) = Tokenizer::new(dialect(backend).as_ref(), sql).tokenize_with_location() else {
+  let Some(tokens) = tokens(sql, backend) else {
     return normalize_text(sql);
   };
-
-  let tokens: Vec<_> = tokens.into_iter().filter(|token| token.token != Token::EOF).collect();
-  let offsets = token_offsets(sql, tokens.iter().map(|token| (token.span.start.line, token.span.start.column)));
 
   let mut normalized = String::with_capacity(sql.len());
   let mut space = false;
   let mut after_line_comment = false;
 
-  for (index, token) in tokens.iter().enumerate() {
-    match &token.token {
+  for (token, range) in tokens {
+    match token {
       Token::Whitespace(Whitespace::Space | Whitespace::Newline | Whitespace::Tab) => space = true,
       token => {
         if after_line_comment {
@@ -478,9 +487,7 @@ pub(crate) fn normalize(sql: &str, backend: DbBackend) -> String {
           normalized.push(' ');
         }
 
-        // Tokens are contiguous: each one runs until the next one starts.
-        let end = offsets.get(index + 1).copied().unwrap_or(sql.len());
-        normalized.push_str(sql[offsets[index]..end].trim_end());
+        normalized.push_str(&sql[range]);
 
         space = false;
         after_line_comment = matches!(token, Token::Whitespace(Whitespace::SingleLineComment { .. }));
@@ -489,28 +496,6 @@ pub(crate) fn normalize(sql: &str, backend: DbBackend) -> String {
   }
 
   normalized
-}
-
-/// Convert token positions, given as a line and a column, both starting at 1
-/// and counted in characters, into byte offsets in `sql`. Positions must come
-/// in order. In `"SELECT\n  1"`, line 2, column 3 (the `1`) is at byte 9.
-fn token_offsets(sql: &str, positions: impl Iterator<Item = (u64, u64)>) -> Vec<usize> {
-  let mut chars = sql.char_indices().peekable();
-  let (mut line, mut column) = (1, 1);
-
-  positions
-    .map(|position| {
-      while (line, column) != position {
-        match chars.next() {
-          Some((_, '\n')) => (line, column) = (line + 1, 1),
-          Some(_) => column += 1,
-          None => return sql.len(),
-        }
-      }
-
-      chars.peek().map_or(sql.len(), |(offset, _)| *offset)
-    })
-    .collect()
 }
 
 /// The fallback of `normalize` for SQL that does not tokenize, such as a
@@ -564,6 +549,10 @@ mod tests {
 
   fn stmt(sql: &str, values: Vec<Value>) -> Statement {
     Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
+  }
+
+  fn args_match(expected: &[Arg], stmt: &Statement) -> bool {
+    wrong_args(expected, stmt.args()).is_none()
   }
 
   #[test]

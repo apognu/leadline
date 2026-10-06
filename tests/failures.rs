@@ -3,7 +3,10 @@
 
 mod common;
 
-use common::cake::{self, cake};
+use common::{
+  cake::{self, cake},
+  problems,
+};
 use leadline::MockDb;
 use sea_orm::{DbBackend, EntityTrait};
 
@@ -30,8 +33,7 @@ async fn unexpected_query_in_spawned_task_is_reported_on_drop() {
 
   let panic = result.unwrap_err().into_panic();
   let message = panic.downcast_ref::<String>().unwrap();
-  assert!(message.contains("unexpected SELECT"), "{message}");
-  assert!(message.contains("no expectation was set"), "{message}");
+  assert!(message.starts_with("leadline: 1 problem:\n  - unexpected SELECT: no expectation was set\n"), "{message}");
 }
 
 #[tokio::test]
@@ -39,19 +41,19 @@ async fn check_reports_and_disarms_drop() {
   let mock = MockDb::new(DbBackend::Postgres);
   mock.expect_delete::<cake::Entity>().rows_affected(1);
 
-  let report = mock.check().unwrap_err().to_string();
-  assert!(report.contains("expectation not met: DELETE on `cake`"), "{report}");
+  let err = mock.check().unwrap_err();
+  assert_eq!(err.problems(), ["expectation not met: DELETE on `cake` with any SQL"]);
 }
 
 #[tokio::test]
-#[should_panic(expected = "expectation not met: DELETE on `cake`")]
+#[should_panic(expected = "leadline: 1 problem:\n  - expectation not met: DELETE on `cake` with any SQL")]
 async fn drop_panics_on_unmet_expectation() {
   let mock = MockDb::new(DbBackend::Postgres);
   mock.expect_delete::<cake::Entity>().rows_affected(1);
 }
 
 #[tokio::test]
-#[should_panic(expected = "expectation not met: DELETE on `cake`")]
+#[should_panic(expected = "leadline: 1 problem:\n  - expectation not met: DELETE on `cake` with any SQL")]
 async fn verify_panics_on_unmet_expectation() {
   let mock = MockDb::new(DbBackend::Postgres);
   mock.expect_delete::<cake::Entity>().rows_affected(1);
@@ -75,7 +77,7 @@ async fn verify_as_a_checkpoint() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "every expectation was already consumed")]
+#[should_panic(expected = "leadline: unexpected DELETE: every expectation was already consumed")]
 async fn reports_consumed_expectations() {
   let mock = MockDb::new(DbBackend::Postgres);
   mock.expect_delete::<cake::Entity>().rows_affected(1);
@@ -86,19 +88,23 @@ async fn reports_consumed_expectations() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "none of the remaining optional expectations matches it:\n      - SELECT on `cake` with any SQL (optional): expected a SELECT statement, got DELETE")]
 async fn reports_why_optional_expectations_did_not_match() {
   let mock = MockDb::new(DbBackend::Postgres);
   mock.expect_select::<cake::Entity>().maybe().returning::<cake::Model>([]);
 
   let db = mock.connection().await;
-  let _ = cake::Entity::delete_by_id(1).exec(&db).await;
+  let problems = problems(&mock, async move {
+    let _ = cake::Entity::delete_by_id(1).exec(&db).await;
+  })
+  .await;
+
+  assert!(
+    problems[0].ends_with("none of the remaining optional expectations matches it:\n      - SELECT on `cake` with any SQL (optional): expected a SELECT statement, got DELETE"),
+    "{problems:?}"
+  );
 }
 
 #[tokio::test]
-#[should_panic(
-  expected = "none of the pending expectations matches it:\n      - DELETE on `cake` with any SQL: expected a DELETE statement, got SELECT\n      - UPDATE on `cake` with any SQL: expected an UPDATE statement, got SELECT"
-)]
 async fn unordered_reports_why_nothing_matched() {
   let mock = MockDb::new(DbBackend::Postgres);
   mock.unordered();
@@ -107,11 +113,21 @@ async fn unordered_reports_why_nothing_matched() {
   mock.expect_update::<cake::Entity>().rows_affected(1);
 
   let db = mock.connection().await;
-  let _ = cake::Entity::find().all(&db).await;
+  let problems = problems(&mock, async move {
+    let _ = cake::Entity::find().all(&db).await;
+  })
+  .await;
+
+  assert!(
+    problems[0].ends_with(
+      "none of the pending expectations matches it:\n      - DELETE on `cake` with any SQL: expected a DELETE statement, got SELECT\n      - UPDATE on `cake` with any SQL: expected an UPDATE statement, got SELECT"
+    ),
+    "{problems:?}"
+  );
 }
 
 #[tokio::test]
-#[should_panic(expected = "which has no result")]
+#[should_panic(expected = "leadline: unexpected SELECT: it matches an expectation that has no result")]
 async fn unfinished_expectation_fails_when_hit() {
   let mock = MockDb::new(DbBackend::Postgres);
 
@@ -127,8 +143,8 @@ async fn unfinished_expectation_is_reported() {
   let mock = MockDb::new(DbBackend::Postgres);
   let _ = mock.expect_delete::<cake::Entity>().with_args((1,));
 
-  let report = mock.check().unwrap_err().to_string();
-  assert!(report.contains("expectation has no result: DELETE on `cake`"), "{report}");
+  let err = mock.check().unwrap_err();
+  assert_eq!(err.problems(), ["expectation has no result: DELETE on `cake` with any SQL and args [Int(Some(1))]"]);
 }
 
 /// Runs `test` on its own thread and runtime, failing if it does not finish
@@ -183,7 +199,6 @@ fn callbacks_can_call_the_mock() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "it reads the written rows back (`RETURNING` on this backend), but its expectation has no rows to return: complete it with `.returning(..)`")]
 async fn writes_read_back_without_rows_fail_clearly() {
   use sea_orm::{ActiveModelTrait, ActiveValue::Set, ActiveValue::Unchanged};
 
@@ -194,16 +209,24 @@ async fn writes_read_back_without_rows_fail_clearly() {
   mock.expect_update::<cake::Entity>().rows_affected(1);
 
   let db = mock.connection().await;
-  let _ = cake::ActiveModel {
-    id: Unchanged(1),
-    name: Set("Lemon".into()),
-  }
-  .update(&db)
+  let problems = problems(&mock, async move {
+    let _ = cake::ActiveModel {
+      id: Unchanged(1),
+      name: Set("Lemon".into()),
+    }
+    .update(&db)
+    .await;
+  })
   .await;
+
+  assert!(
+    problems[0]
+      .ends_with("it reads the written rows back (`RETURNING` on this backend), but its expectation has no rows to return: complete it with `.returning(..)` (`.returning::<Model>([])` for none)"),
+    "{problems:?}"
+  );
 }
 
 #[tokio::test]
-#[should_panic(expected = "but its expectation has no rows to return: complete it with `.returning_rows(..)`")]
 async fn untyped_writes_read_back_without_rows_fail_clearly() {
   use sea_orm::{ConnectionTrait, Statement};
 
@@ -214,5 +237,13 @@ async fn untyped_writes_read_back_without_rows_fail_clearly() {
 
   let db = mock.connection().await;
   let stmt = Statement::from_string(DbBackend::Postgres, r#"INSERT INTO "cake" ("name") VALUES ('Lemon') RETURNING "id""#);
-  let _ = db.query_all_raw(stmt).await;
+  let problems = problems(&mock, async move {
+    let _ = db.query_all_raw(stmt).await;
+  })
+  .await;
+
+  assert!(
+    problems[0].ends_with("but its expectation has no rows to return: complete it with `.returning_rows(..)` (an empty list for none)"),
+    "{problems:?}"
+  );
 }

@@ -3,12 +3,14 @@
 
 mod common;
 
-use common::cake::{self, cake};
+use common::{
+  cake::{self, cake},
+  problems,
+};
 use leadline::MockDb;
 use sea_orm::{DbBackend, EntityTrait};
 
 #[tokio::test]
-#[should_panic(expected = "next expectation is DELETE on `cake` with any SQL, but expected a DELETE statement, got SELECT")]
 async fn ordered_by_default() {
   let mock = MockDb::new(DbBackend::Postgres);
 
@@ -16,7 +18,15 @@ async fn ordered_by_default() {
   mock.expect_select::<cake::Entity>().returning::<cake::Model>([]);
 
   let db = mock.connection().await;
-  let _ = cake::Entity::find().all(&db).await;
+  let problems = problems(&mock, async move {
+    let _ = cake::Entity::find().all(&db).await;
+  })
+  .await;
+
+  assert!(
+    problems[0].contains("the next expectation does not match it (DELETE on `cake` with any SQL): expected a DELETE statement, got SELECT"),
+    "{problems:?}"
+  );
 }
 
 #[tokio::test]
@@ -75,11 +85,12 @@ async fn times_then_next() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "expectation not met: DELETE on `cake` with any SQL (1/2 calls)")]
 async fn times_not_reached() {
   let mock = MockDb::new(DbBackend::MySql);
   mock.expect_delete::<cake::Entity>().times(2).rows_affected(1);
 
   let db = mock.connection().await;
   cake::Entity::delete_by_id(1).exec(&db).await.unwrap();
+
+  assert_eq!(mock.check().unwrap_err().problems(), ["expectation not met: DELETE on `cake` with any SQL (1/2 calls)"]);
 }

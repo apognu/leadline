@@ -142,15 +142,74 @@ mock.expect_commit();
 
 ## Failures
 
-A statement that matches no expectation makes the call panic, which fails the test at that point:
+A statement that matches no expectation makes the call panic, which fails the test at that point. The message starts with a one-line summary, followed by a diagnostic in the style of the Rust compiler's errors: where each expectation involved was declared, and how the statement received differs from it.
 
-```text
-leadline: unexpected SELECT `SELECT "cake"."id", "cake"."name" FROM "cake" WHERE "cake"."id" = $1`
-with [Int(Some(2))]: next expectation is SELECT on `cake` with statement `…` with [Int(Some(1))],
-but it does not match statement `…`
+For example, with an unordered mock, where the statement is compared to every pending expectation:
+
+```rust
+let mock = MockDb::new(DbBackend::Postgres).unordered();
+mock.expect_delete::<cake::Entity>().rows_affected(1);
+mock.expect_select::<bakery::Entity>().returning::<bakery::Model>([]);
+mock.expect_select::<cake::Entity>().matching(cake::Entity::find_by_id(1)).returning([cake(1, "Chocolate")]);
+mock
+  .expect_select::<cake::Entity>()
+  .matching_ignoring_limit(cake::Entity::find().filter(cake::Column::Name.like("%choc%")))
+  .returning([cake(1, "Chocolate")]);
+
+let db = mock.connection().await;
+cake::Entity::find_by_id(1).one(&db).await?;
 ```
 
-When the last clone of the mock is dropped, it reports any remaining problem: unmet expectations, and unexpected statements whose panic was caught elsewhere, for example in a spawned task. `mock.verify()` performs the same check during a test, and `mock.check()` returns the problems instead of panicking.
+```text
+leadline: unexpected SELECT: none of the pending expectations matches it
+
+error: unexpected SELECT
+  |
+1 | SELECT "cake"."id", "cake"."name" FROM "cake" WHERE "cake"."id" = {1} LIMIT {1}
+  |
+  = note: none of the 4 pending expectations matches it
+  = note: on another table: SELECT on `bakery` with any SQL (tests/cakes.rs:14:8)
+  = note: 1 expectation of another kind is not shown
+  = note: bound values are shown in place of their placeholders, between braces
+
+note: candidate 1 of 2
+  --> tests/cakes.rs:15:8
+   |
+15 |   mock.expect_select::<cake::Entity>().matching(cake::Entity::find_by_id(1)).returning([cake(1, "Chocolate")]);
+   |        -------------------------------------------------------------------------------------------------------- declared here
+   |
+ 1 | SELECT "cake"."id", "cake"."name" FROM "cake" WHERE "cake"."id" = {1} LIMIT {1}
+   |                                                                       +++++++++
+   = help: they only differ by LIMIT/OFFSET, which `.one()` and paginators add: use `matching_ignoring_limit`
+
+note: candidate 2 of 2
+  --> tests/cakes.rs:17:6
+   |
+17 |     .expect_select::<cake::Entity>()
+   |      ------------------------------- declared here
+   |
+ 1 - SELECT "cake"."id", "cake"."name" FROM "cake" WHERE "cake"."name" LIKE {'%choc%'}
+ 1 + SELECT "cake"."id", "cake"."name" FROM "cake" WHERE "cake"."id" = {1}
+   |
+   = note: LIMIT and OFFSET are ignored
+```
+
+In this report:
+
+- Bound values are shown in place of their placeholders (`$1`), or in color when applicable.
+- The expectations most likely meant, `SELECT`s on `cake`, each get a block, with how they differ from the statement, and a hint when the cause is a common one.
+- The one on another table gets a line, and the one of another kind (the `DELETE`) is only counted.
+
+In an ordered mock, the report shows the next expectation instead, which the statement had to match.
+
+When the last clone of the mock is dropped, it reports any remaining problem: unmet expectations, and unexpected statements whose panic was caught elsewhere, for example in a spawned task. `mock.verify()` performs the same check during a test.
+
+`mock.check()` returns the problems instead of panicking. Its `problems()` describes each one in plain text, which is what tests checking a failure should assert on, rather than on the panic message:
+
+```rust
+let err = mock.check().unwrap_err();
+assert_eq!(err.problems(), ["expectation not met: DELETE on `cake` with any SQL"]);
+```
 
 ## Things to keep in mind
 

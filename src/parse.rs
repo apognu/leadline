@@ -1,8 +1,11 @@
+use std::ops::Range;
+
 use sea_orm::{DbBackend, Statement, Value};
 use sqlparser::{
   ast::{self, Expr, LimitClause, ObjectName, ObjectNamePart, SelectItem, SetExpr, TableFactor, TableObject},
   dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect},
   parser::Parser,
+  tokenizer::{Token, Tokenizer},
 };
 
 use crate::{classify::StmtKind, matcher::StatementExt};
@@ -69,6 +72,63 @@ pub(crate) fn dialect(backend: DbBackend) -> Box<dyn Dialect> {
   }
 }
 
+/// Split `sql` into tokens, in the dialect of `backend`, each with its byte
+/// range in `sql`: `SELECT  "id"` gives `SELECT` at `0..6` and `"id"` at
+/// `8..12`, with whitespace tokens in between.
+///
+/// A range covers its token without the whitespace after it: whitespace
+/// tokens get empty ranges, and a `--` comment, which the tokenizer ends with
+/// its line break, gets a range without it. Returns
+/// `None` when `sql` does not tokenize, such as a fragment ending inside a
+/// quote.
+pub(crate) fn tokens(sql: &str, backend: DbBackend) -> Option<Vec<(Token, Range<usize>)>> {
+  let tokens: Vec<_> = Tokenizer::new(dialect(backend).as_ref(), sql)
+    .tokenize_with_location()
+    .ok()?
+    .into_iter()
+    .filter(|token| token.token != Token::EOF)
+    .collect();
+
+  let offsets = token_offsets(sql, tokens.iter().map(|token| (token.span.start.line, token.span.start.column)));
+
+  let tokens = tokens
+    .into_iter()
+    .enumerate()
+    .map(|(index, token)| {
+      // Tokens are contiguous: each one runs until the next one starts.
+      let end = offsets.get(index + 1).copied().unwrap_or(sql.len());
+      let text = sql[offsets[index]..end].trim_end();
+
+      (token.token, offsets[index]..offsets[index] + text.len())
+    })
+    .collect();
+
+  Some(tokens)
+}
+
+/// Convert the positions of tokens, which the tokenizer gives as a line and a
+/// column (both counted from 1, in characters), into byte offsets in `sql`.
+/// In `"SELECT\n  1"`, line 2, column 3 (the `1`) is at byte 9. Positions must
+/// come in order: the text is scanned once.
+fn token_offsets(sql: &str, positions: impl Iterator<Item = (u64, u64)>) -> Vec<usize> {
+  let mut chars = sql.char_indices().peekable();
+  let (mut line, mut column) = (1, 1);
+
+  positions
+    .map(|position| {
+      while (line, column) != position {
+        match chars.next() {
+          Some((_, '\n')) => (line, column) = (line + 1, 1),
+          Some(_) => column += 1,
+          None => return sql.len(),
+        }
+      }
+
+      chars.peek().map_or(sql.len(), |(offset, _)| *offset)
+    })
+    .collect()
+}
+
 fn statement_kind(ast: &ast::Statement) -> StmtKind {
   match ast {
     ast::Statement::Query(query) => set_expr_kind(&query.body),
@@ -93,7 +153,7 @@ fn set_expr_kind(body: &SetExpr) -> StmtKind {
   }
 }
 
-/// The common table expressions of a statement, by name.
+/// Collect the common table expressions of `ast`, by name.
 fn ctes(ast: &ast::Statement) -> Vec<(String, &ast::Query)> {
   let ast::Statement::Query(query) = ast else {
     return Vec::new();

@@ -7,7 +7,7 @@ use sea_orm::{
 };
 
 use crate::{
-  expectation::{Exec, Expectation, Rows, into_proxy_row},
+  expectation::{Exec, Expectation, Rows, into_proxy_row, rows_with},
   matcher::{IntoArgs, SqlMatcher, integer},
   mock::ExpectationRef,
 };
@@ -29,7 +29,14 @@ fn integer_key<M: ModelTrait>(model: &M) -> Option<u64> {
     return None;
   };
 
-  integer(&model.get(key.into_column()))?.and_then(|n| u64::try_from(n).ok())
+  as_u64(&model.get(key.into_column()))
+}
+
+/// Read an integer value as a `u64`, the type of the last inserted ID:
+/// `Value::Int(Some(7))` gives `Some(7)`. Returns `None` for a `NULL`, a
+/// negative integer, or a value that is not an integer.
+fn as_u64(value: &Value) -> Option<u64> {
+  integer(value).flatten().and_then(|n| u64::try_from(n).ok())
 }
 
 /// Methods shared by the three pending builders: the matchers, `times`, `maybe`
@@ -370,10 +377,7 @@ macro_rules! matching_methods {
     /// # }
     /// ```
     pub fn times(self, n: usize) -> Self {
-      self.set(|e| {
-        e.min = if e.min == 0 { 0 } else { n };
-        e.max = n;
-      })
+      self.set(|e| e.times(n))
     }
 
     /// Make this expectation optional: it may be met up to its
@@ -403,7 +407,7 @@ macro_rules! matching_methods {
     /// # }
     /// ```
     pub fn maybe(self) -> Self {
-      self.set(|e| e.min = 0)
+      self.set(Expectation::maybe)
     }
 
     /// Complete the expectation by failing the statement with `err`.
@@ -553,8 +557,7 @@ impl<E: EntityTrait> SelectExpectation<E> {
     M: ModelTrait<Entity = E>,
     F: Fn(&Statement) -> Result<Vec<M>, DbErr> + Send + Sync + 'static,
   {
-    let f = move |stmt: &Statement| Ok(f(stmt)?.into_iter().map(into_proxy_row).collect());
-    self.inner.update(|e| e.response_mut().rows = Some(Rows::Fn(Arc::new(f))));
+    self.inner.update(|e| e.response_mut().rows = Some(rows_with(f)));
   }
 
   /// Complete the expectation by returning these models, each with extra
@@ -901,7 +904,7 @@ impl<E: EntityTrait> ExecExpectation<E> {
 
     let rows = {
       let f = f.clone();
-      move |stmt: &Statement| Ok(f(stmt)?.into_iter().map(into_proxy_row).collect())
+      rows_with(move |stmt| f(stmt))
     };
 
     // Without `RETURNING` (MySQL), the write is executed: report the models as
@@ -920,7 +923,7 @@ impl<E: EntityTrait> ExecExpectation<E> {
 
     self.inner.update(|e| {
       let response = e.response_mut();
-      response.rows = Some(Rows::Fn(Arc::new(rows)));
+      response.rows = Some(rows);
       response.exec = Some(Exec::Fn(Arc::new(exec)));
     });
   }
@@ -1064,7 +1067,7 @@ impl<E: EntityTrait> ExecResponse<E> {
     let values: Vec<Value> = key.into().into_value_tuple().into_iter().collect();
 
     let id = match values.as_slice() {
-      [value] => integer(value).flatten().and_then(|n| u64::try_from(n).ok()),
+      [value] => as_u64(value),
       _ => None,
     };
 
@@ -1177,8 +1180,7 @@ impl QueryExpectation {
     R: IntoMockRow,
     F: Fn(&Statement) -> Result<Vec<R>, DbErr> + Send + Sync + 'static,
   {
-    let f = move |stmt: &Statement| Ok(f(stmt)?.into_iter().map(into_proxy_row).collect());
-    self.inner.update(|e| e.response_mut().rows = Some(Rows::Fn(Arc::new(f))));
+    self.inner.update(|e| e.response_mut().rows = Some(rows_with(f)));
   }
 
   /// Complete the expectation by reporting `n` affected rows. The returned
@@ -1357,11 +1359,7 @@ impl TransactionExpectation {
   /// # }
   /// ```
   pub fn times(self, n: usize) -> Self {
-    self.inner.update(|e| {
-      e.min = if e.min == 0 { 0 } else { n };
-      e.max = n;
-    });
-
+    self.inner.update(|e| e.times(n));
     self
   }
 
@@ -1387,7 +1385,7 @@ impl TransactionExpectation {
   /// # }
   /// ```
   pub fn maybe(self) -> Self {
-    self.inner.update(|e| e.min = 0);
+    self.inner.update(Expectation::maybe);
     self
   }
 }
